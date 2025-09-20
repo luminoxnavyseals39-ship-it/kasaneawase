@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>重ね合わせの原理シミュレーション（近傍界＋遠方界）</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+  <style>
+    body { background:#222; color:#eee; font-family: sans-serif; }
+    .controls { margin:10px; line-height: 2; display:flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; }
+    .controls .group { display:inline-flex; gap:6px; align-items:center; }
+    input[type="number"] { width: 100px; }
+    select { height: 26px; }
+    #phaseContainer label { margin-right:12px; white-space: nowrap; }
+    .note { color:#bbb; font-size: 12px; margin-left: 6px; }
+    .divider { flex-basis: 100%; height: 0; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <div class="group">
+      <label>センサ数:</label>
+      <input id="numSensors" type="number" min="1" max="5" value="3" />
+    </div>
+
+    <div class="group">
+      <label>周波数:</label>
+      <input id="frequency" type="number" step="0.1" value="1.0" />
+      <select id="freqUnit">
+        <option value="GHz" selected>GHz</option>
+        <option value="Hz">Hz</option>
+      </select>
+    </div>
+
+    <div class="group">
+      <label>振幅:</label>
+      <input id="amplitude" type="number" step="0.1" min="0.1" value="1" />
+    </div>
+
+    <div class="group">
+      <label>ビーム角度(°):</label>
+      <input id="beamAngle" type="number" step="1" value="0" />
+      <span class="note">0°=右, 90°=上</span>
+    </div>
+
+    <div class="group">
+      <label>描画:</label>
+      <select id="palette">
+        <option value="color" selected>カラー</option>
+        <option value="bw">白黒（閾値赤）</option>
+      </select>
+    </div>
+
+    <div class="group">
+      <label>閾値(0〜1):</label>
+      <input id="threshold" type="number" step="0.05" min="0" max="1" value="0.7" />
+    </div>
+
+    <span class="divider"></span>
+
+    <div class="group">
+      <span id="wavelengthDisplay"></span>
+      <span class="note">スケール: 1 m = 100 px</span>
+    </div>
+
+    <span class="divider"></span>
+
+    <div id="phaseContainer"></div>
+  </div>
+
+  <script>
+    const c = 3.0e8;
+    const scale = 100;
+    const NF_W = 900;
+    const CANVAS_H = 600;
+    const CANVAS_W = NF_W + 380;
+
+    let sensors = [];
+    let numSensors = 3;
+    let frequencyHz = 1.0e9;
+    let wavelength_px = 100;
+    let amplitude = 1;
+    let phases = [];
+    let beamAngle = 0;
+    let palette = "color";
+    let threshold = 0.7;
+
+    let phaseInputs = [];
+    let draggingSensor = null;
+    let offsetX = 0, offsetY = 0;
+
+    let nfPixels;
+    let ffPoints;
+
+    function setup() {
+      createCanvas(CANVAS_W, CANVAS_H);
+      pixelDensity(1);
+      colorMode(HSB, 255);
+      setupUI();
+      recalcWavelength();
+      initSensors();
+      renderPhaseInputs();
+      applyBeamPhases();
+      updateNearField();
+      updateFarField();
+    }
+
+    function val(id) { return document.getElementById(id).value; }
+    function on(id, evt, handler) { document.getElementById(id).addEventListener(evt, handler); }
+
+    function setupUI() {
+      on("numSensors", "input", () => { numSensors = constrain(int(val("numSensors")), 1, 5); initSensors(); renderPhaseInputs(); applyBeamPhases(); updateNearField(); updateFarField(); });
+      const onFreqChange = () => {
+        const unit = val("freqUnit");
+        const f = parseFloat(val("frequency")) || 0;
+        frequencyHz = (unit === "GHz") ? f * 1e9 : f;
+        if (frequencyHz < 1) frequencyHz = 1;
+        recalcWavelength();
+        initSensors();
+        applyBeamPhases();
+        updateNearField();
+        updateFarField();
+      };
+      on("frequency", "input", onFreqChange);
+      on("freqUnit", "change", onFreqChange);
+      on("amplitude", "input", () => { amplitude = max(parseFloat(val("amplitude")) || 0.1, 0.1); updateNearField(); updateFarField(); });
+      on("beamAngle", "input", () => { beamAngle = parseFloat(val("beamAngle")) || 0; applyBeamPhases(); updateNearField(); updateFarField(); });
+      on("palette", "change", () => { palette = val("palette"); updateNearField(); });
+      on("threshold", "input", () => { threshold = constrain(parseFloat(val("threshold")) || 0, 0, 1); updateNearField(); });
+    }
+
+    function recalcWavelength() {
+      const lambda_m = c / frequencyHz;
+      wavelength_px = lambda_m * scale;
+      document.getElementById("wavelengthDisplay").innerText = `波長: ${lambda_m.toExponential(3)} m ／ ${wavelength_px.toFixed(1)} px`;
+    }
+
+    function initSensors() {
+      sensors = [];
+      const spacing = wavelength_px / 2;
+      const startX = NF_W / 2 - (numSensors - 1) * spacing / 2;
+      const y = CANVAS_H / 2;
+      for (let i = 0; i < numSensors; i++) sensors.push({ x: startX + i * spacing, y: y });
+      phases = new Array(numSensors).fill(0);
+    }
+
+    function renderPhaseInputs() {
+      const container = document.getElementById("phaseContainer");
+      container.innerHTML = "";
+      phaseInputs = [];
+      for (let i = 0; i < numSensors; i++) {
+        const label = document.createElement("label");
+        label.textContent = `P${i+1}(°): `;
+        const input = document.createElement("input");
+        input.type = "number"; input.step = "1"; input.value = "0";
+        input.addEventListener("input", e => { phases[i] = radians(parseFloat(e.target.value) || 0); updateNearField(); updateFarField(); });
+        label.appendChild(input);
+        container.appendChild(label);
+        phaseInputs.push(input);
+      }
+    }
+
+    function angleUnitScreen(thetaDeg) {
+      const th = radians(thetaDeg);
+      return { ux: cos(th), uy: -sin(th) };
+    }
+
+    function applyBeamPhases() {
+      const lambda_m = c / frequencyHz;
+      const k = TWO_PI / lambda_m;
+      const { ux, uy } = angleUnitScreen(beamAngle);
+      const x0 = sensors[0].x, y0 = sensors[0].y;
+      for (let i = 0; i < sensors.length; i++) {
+        const dx_m = (sensors[i].x - x0) / scale;
+        const dy_m = (sensors[i].y - y0) / scale;
+        const phaseRad = k * (dx_m * ux + dy_m * uy);
+        phases[i] = phaseRad;
+        if (phaseInputs[i]) phaseInputs[i].value = degrees(phaseRad).toFixed(1);
+      }
+    }
+
+    function updateNearField() {
+      nfPixels = createImage(NF_W, CANVAS_H);
+      nfPixels.loadPixels();
+      const t = frameCount / 60; // 秒換算
+      const k_px = TWO_PI / wavelength_px;
+      const omega = TWO_PI * frequencyHz;
+      const maxAmp = sensors.length * amplitude;
+
+      for (let y = 0; y < CANVAS_H; y++) {
+        for (let x = 0; x < NF_W; x++) {
+          let sum = 0;
+          for (let i = 0; i < sensors.length; i++) {
+            const s = sensors[i];
+            const d = dist(x, y, s.x, s.y);
+            sum += amplitude * sin(k_px * d - omega * t + phases[i]);
+          }
+          let r, g, b;
+          if (palette === "color") {
+            const hueVal = map(sum, -maxAmp, maxAmp, 0, 255);
+            const col = color(hueVal, 255, 255);
+            r = red(col); g = green(col); b = blue(col);
+          } else {
+            const norm = Math.min(1, Math.abs(sum) / maxAmp);
+            if (norm >= threshold) {
+              r = 255; g = 64; b = 64;
+            } else {
+              const gray = map(sum, -maxAmp, maxAmp, 0, 255);
+              r = gray; g = gray; b = gray;
+            }
+          }
+          const idx = 4 * (y * NF_W + x);
+          nfPixels.pixels[idx] = r;
+          nfPixels.pixels[idx+1] = g;
+          nfPixels.pixels[idx+2] = b;
+          nfPixels.pixels[idx+3] = 255;
+        }
+      }
+      nfPixels.updatePixels();
+    }
+
+
+    function drawGridAndScaleBar() {
+      for (let x = 0; x <= NF_W; x += scale) {
+        stroke(200, 100);
+        strokeWeight(x % (scale * 5) === 0 ? 2 : 1);
+        line(x, 0, x, CANVAS_H);
+      }
+      for (let y = 0; y <= CANVAS_H; y += scale) {
+        stroke(200, 100);
+        strokeWeight(y % (scale * 5) === 0 ? 2 : 1);
+        line(0, y, NF_W, y);
+      }
+      stroke(255); strokeWeight(3);
+      const barLen = 5 * scale;
+      line(40, CANVAS_H - 30, 40 + barLen, CANVAS_H - 30);
+      noStroke(); fill(255); textSize(14);
+      text("5 m", 40 + barLen / 2 - 12, CANVAS_H - 42);
+    }
+
+    function drawSensors() {
+      textAlign(LEFT, CENTER);
+      textSize(12);
+      for (let i = 0; i < sensors.length; i++) {
+        const s = sensors[i];
+        stroke(255);
+        fill(255, 80, 80);
+        ellipse(s.x, s.y, 14, 14);
+        noStroke();
+        fill(255);
+        text(`P${i+1}`, s.x + 10, s.y - 8);
+        fill(230);
+        const xm = (s.x / scale).toFixed(2);
+        const ym = (s.y / scale).toFixed(2);
+        text(`(${xm} m, ${ym} m)`, s.x + 10, s.y + 8);
+      }
+    }
+
+    function draw() {
+      background(0);
+      // 初回またはnフレームに1回更新
+      if (frameCount === 1 || frameCount % 10 === 0) {
+        updateNearField();
+        updateFarField();
+      }
+      if (nfPixels) image(nfPixels, 0, 0);
+      drawGridAndScaleBar();
+      drawSensors();
+      if (ffPoints) drawFarFieldPolar();
+    }
+
+    function updateFarField() {
+      const panelW = width - NF_W;
+      const cx = NF_W + panelW / 2;
+      const cy = CANVAS_H / 2;
+      const R = Math.min(panelW, CANVAS_H) * 0.45;
+
+      const lambda_m = c / frequencyHz;
+      const k = TWO_PI / lambda_m;
+      const x0 = sensors[0]?.x ?? 0;
+      const y0 = sensors[0]?.y ?? 0;
+
+      const steps = 720; // 0.5°刻み
+      let maxMag = 1e-9;
+      const mags = new Array(steps);
+
+      for (let i = 0; i < steps; i++) {
+		const angDeg = (i / steps) * 360; // 0°=上、時計回り
+		const th = radians(angDeg);
+		const ux = Math.sin(th);
+		const uy = -Math.cos(th);
+		
+        let re = 0, im = 0;
+        for (let n = 0; n < sensors.length; n++) {
+          const s = sensors[n];
+          const dx_m = (s.x - x0) / scale;
+          const dy_m = (s.y - y0) / scale;
+          const phase = k * (dx_m * ux + dy_m * uy) + phases[n];
+          re += amplitude * cos(phase);
+          im += amplitude * sin(phase);
+        }
+        const mag = sqrt(re * re + im * im);
+        mags[i] = mag;
+        if (mag > maxMag) maxMag = mag;
+      }
+
+      // 正規化して描画用座標を保存
+      ffPoints = [];
+      for (let i = 0; i < steps; i++) {
+        const angDeg = (i / steps) * 360;
+        const th = radians(angDeg);
+        const m = mags[i] / maxMag;
+        const rr = m * R;
+        //const x = cx + rr * cos(th);
+        //const y = cy - rr * sin(th);
+        const x = cx + rr * -Math.sin(th);
+        const y = cy + rr * Math.cos(th);
+        ffPoints.push({ x, y });
+      }
+    }
+
+    function drawFarFieldPolar() {
+      const panelX0 = NF_W;
+      const panelW = width - NF_W;
+      const cx = panelX0 + panelW / 2;
+      const cy = CANVAS_H / 2;
+      const R = Math.min(panelW, CANVAS_H) * 0.45;
+
+      // 背景
+      noStroke(); fill(10);
+      rect(panelX0, 0, panelW, CANVAS_H);
+
+      // 同心円
+      stroke(120); noFill();
+      for (let f = 0.25; f <= 1.001; f += 0.25) {
+        ellipse(cx, cy, 2 * R * f, 2 * R * f);
+      }
+      // 角度ガイド
+      for (let ang = 0; ang < 360; ang += 30) {
+        const a = radians(ang);
+        const x2 = cx + R * cos(a);
+        const y2 = cy - R * sin(a);
+        stroke(80);
+        line(cx, cy, x2, y2);
+      }
+      // 主軸ラベル
+      noStroke(); fill(200); textSize(12);
+      textAlign(CENTER, BOTTOM); text("0°",  cx, cy - R - 6);
+      textAlign(LEFT, CENTER);   text("90°",   cx + R + 6 - 20, cy);
+      textAlign(CENTER, TOP);    text("180°", cx, cy + R + 6);
+      textAlign(RIGHT, CENTER);  text("270°", cx - R - 6 + 20, cy);
+
+      // パターン描画
+      if (ffPoints && ffPoints.length > 0) {
+        noFill();
+        stroke(80, 220, 255);
+        strokeWeight(2);
+        beginShape();
+        for (const p of ffPoints) vertex(p.x, p.y);
+        endShape(CLOSE);
+      }
+    }
+
+    // マウス操作
+    function mousePressed() {
+      if (mouseX < 0 || mouseX > NF_W || mouseY < 0 || mouseY > CANVAS_H) return;
+      for (const s of sensors) {
+        if (dist(mouseX, mouseY, s.x, s.y) < 10) {
+          draggingSensor = s;
+          offsetX = mouseX - s.x;
+          offsetY = mouseY - s.y;
+          break;
+        }
+      }
+    }
+
+    function mouseDragged() {
+      if (draggingSensor) {
+        draggingSensor.x = constrain(mouseX - offsetX, 0, NF_W - 1);
+        draggingSensor.y = constrain(mouseY - offsetY, 0, CANVAS_H - 1);
+        applyBeamPhases();
+        updateNearField();
+        updateFarField();
+      }
+    }
+
+    function mouseReleased() {
+      draggingSensor = null;
+    }
+    
+    
+	// 0°=上、時計回り
+	function angleUnitScreen(thetaDeg) {
+	  const th = radians(thetaDeg); // 入力角度そのまま（上0°）
+	  const ux = Math.sin(th);      // X成分：右方向が正
+	  const uy = -Math.cos(th);     // Y成分：下方向が正なので -cos
+	  return { ux, uy };
+	}    
+    
+  </script>
+</body>
+</html>
+
+
+
+
+
